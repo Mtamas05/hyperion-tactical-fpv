@@ -41,43 +41,37 @@ Designed for robust cyber-tactical operations, this project bridges the gap betw
 
 ```mermaid
 flowchart TD
-    subgraph Drone[UAV Hardware (Tello)]
-        Cam(H.264 Camera)
-        FC(Flight Controller)
+    subgraph Drone[Tello UAV]
+        Cam[Camera H.264 Stream]
+        FC[Flight Controller & Sensors]
     end
 
-    subgraph Net[Networking Layer]
-        UDP_Video[UDP Video Socket :11111]
-        UDP_Cmd[UDP Command/Telemetry :8889 / :8890]
+    subgraph Network[UDP Network Layer]
+        UDP_Video[UDP Port 11111 - Video Stream]
+        UDP_State[UDP Port 8890 - Telemetry]
+        UDP_Cmd[UDP Port 8889 - Commands]
     end
 
-    subgraph App[Android App]
-        Decoder[TelloVideoDecoder\nNAL Parser -> MediaCodec]
-        Muxer[TelloStreamRecorder\nMediaMuxer MP4]
-        
-        Session[TelloFlightSession\nCoroutines & Sockets]
-        State[StateFlow\nTelemetry & Status]
-        
-        Yolo[YoloDetector\nTensorFlow Lite]
-        PID[TelloActiveTracker\nPID Controller]
-        
-        HUD[Jetpack Compose HUD\nCanvas & Overlays]
+    subgraph App[Hyperion Tactical Station]
+        Decoder[MediaCodec Low-Latency Pipeline]
+        Session[TelloFlightSession & Watchdog]
+        Detector[TensorFlow Lite YOLO Task]
+        Tracker[Closed-Loop PID ActiveTrack]
+        HUD[Jetpack Compose Tactical Canvas]
     end
 
-    Cam -->|Raw NAL Units| UDP_Video
-    FC <-->|Commands & Telemetry| UDP_Cmd
+    Cam --> UDP_Video
+    FC --> UDP_State
+    UDP_Cmd --> FC
 
     UDP_Video --> Decoder
-    Decoder -->|Surface| HUD
-    Decoder -->|Keyframes| Muxer
-
-    UDP_Cmd <--> Session
-    Session --> State
-    State --> HUD
-
-    Decoder -.->|Bitmaps| Yolo
-    Yolo -->|Bounding Box| PID
-    PID -->|RC Vectors| Session
+    Decoder --> HUD
+    Decoder --> Detector
+    Detector --> Tracker
+    Tracker --> Session
+    Session --> UDP_Cmd
+    UDP_State --> Session
+    Session --> HUD
 ```
 
 ---
