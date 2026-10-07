@@ -1,0 +1,19 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.hyperiontech.tellofpv.app-mergeDebugResources-49:/values-v30/values-v30.xml",
+            "map": [
+                {
+                    "source": "C:\\Users\\tamas\\.gradle\\caches\\8.11.1\\transforms\\81205009380e8388a20b37ed5d82569e\\transformed\\jetified-material3-release\\res\\values-v30\\values-v30.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endColumns": "72",
+                        "endOffsets": "123"
+                    }
+                }
+            ]
+        }
+    ]
+}
