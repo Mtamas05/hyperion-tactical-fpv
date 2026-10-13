@@ -10,6 +10,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,30 +22,88 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import kotlin.math.abs
+
+enum class ConnectionState {
+    DISCONNECTED,
+    CONNECTING,
+    ONLINE
+}
+
+enum class FlipDirection(val sdkValue: String, val label: String) {
+    FORWARD("f", "ELŐRE"),
+    BACK("b", "HÁTRA"),
+    LEFT("l", "BALRA"),
+    RIGHT("r", "JOBBRA")
+}
+
+data class TelloTelemetry(
+    val battery: Int = 0,
+    val temperatureC: Int = 0,
+    val pitch: Int = 0,
+    val roll: Int = 0,
+    val heightCm: Int = 0,
+    val tofCm: Int = 0,
+    val connected: Boolean = false
+)
 
 /** A Tello motorjait kizárólag a [killMotors] kapcsolhatja le azonnal. */
 class TelloFlightSession(private val context: Context? = null) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val host = InetAddress.getByName("192.168.10.1")
     private val commandPort = 8889
+
+    private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
+    val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
+
     private val _telemetry = MutableStateFlow(TelloTelemetry())
     val telemetry: StateFlow<TelloTelemetry> = _telemetry.asStateFlow()
 
     private var dangerousTiltSamples = 0
+    private var connectJob: Job? = null
     private var keepAliveJob: Job? = null
+    private var telemetryJob: Job? = null
+    private var simulationJob: Job? = null
+
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val networkBoundSignal = CompletableDeferred<Boolean>()
+    @Volatile var isNetworkBound: Boolean = false
+        private set
+
+    @Volatile private var commandSocket: DatagramSocket? = null
     @Volatile private var telemetrySocket: DatagramSocket? = null
+    private val sendMutex = Mutex()
 
     init {
         bindProcessToDroneWifi()
     }
 
     private fun bindProcessToDroneWifi() {
-        val cm = context?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val cm = context?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        if (cm == null) {
+            isNetworkBound = true
+            if (!networkBoundSignal.isCompleted) networkBoundSignal.complete(true)
+            return
+        }
+
+        val active = cm.activeNetwork
+        if (active != null) {
+            val caps = cm.getNetworkCapabilities(active)
+            if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+                runCatching { cm.bindProcessToNetwork(active) }
+                isNetworkBound = true
+                if (!networkBoundSignal.isCompleted) networkBoundSignal.complete(true)
+            }
+        }
+
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -52,18 +111,126 @@ class TelloFlightSession(private val context: Context? = null) {
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                cm.bindProcessToNetwork(network)
+                runCatching { cm.bindProcessToNetwork(network) }
+                isNetworkBound = true
+                if (!networkBoundSignal.isCompleted) {
+                    networkBoundSignal.complete(true)
+                }
+                if (_connectionState.value == ConnectionState.DISCONNECTED) {
+                    connect()
+                }
+            }
+
+            override fun onLost(network: Network) {
+                isNetworkBound = false
+                _connectionState.value = ConnectionState.DISCONNECTED
+                _telemetry.value = _telemetry.value.copy(connected = false)
             }
         }
-        networkCallback?.let { cm.requestNetwork(request, it) }
+
+        runCatching {
+            networkCallback?.let { cm.requestNetwork(request, it) }
+        }.onFailure {
+            isNetworkBound = true
+            if (!networkBoundSignal.isCompleted) {
+                networkBoundSignal.complete(true)
+            }
+        }
+    }
+
+    private fun getOrCreateCommandSocket(): DatagramSocket {
+        val existing = commandSocket
+        if (existing != null && !existing.isClosed) {
+            return existing
+        }
+        val socket = DatagramSocket(null).apply {
+            reuseAddress = true
+            soTimeout = 1500
+            bind(InetSocketAddress(0))
+        }
+        commandSocket = socket
+        return socket
+    }
+
+    private suspend fun sendAndAwaitReply(command: String, timeoutMs: Int = 1500): String? = withContext(Dispatchers.IO) {
+        sendMutex.withLock {
+            runCatching {
+                val socket = getOrCreateCommandSocket()
+
+                // Kiürítjük az esetleges beragadt korábbi csomagokat
+                val drainBuffer = ByteArray(256)
+                val drainPacket = DatagramPacket(drainBuffer, drainBuffer.size)
+                socket.soTimeout = 1
+                while (true) {
+                    try {
+                        socket.receive(drainPacket)
+                    } catch (_: Exception) {
+                        break
+                    }
+                }
+
+                // Parancs küldése
+                val bytes = command.encodeToByteArray()
+                val packet = DatagramPacket(bytes, bytes.size, host, commandPort)
+                socket.soTimeout = timeoutMs
+                socket.send(packet)
+
+                // Válasz fogadása
+                val receiveBuffer = ByteArray(256)
+                val receivePacket = DatagramPacket(receiveBuffer, receiveBuffer.size)
+                socket.receive(receivePacket)
+                receivePacket.data.decodeToString(0, receivePacket.length).trim()
+            }.getOrNull()
+        }
     }
 
     fun connect() {
-        send("command")
-        startKeepAlive()
+        if (simulationMode) {
+            _connectionState.value = ConnectionState.ONLINE
+            _telemetry.value = _telemetry.value.copy(connected = true)
+            return
+        }
+
+        connectJob?.cancel()
+        connectJob = scope.launch(Dispatchers.IO) {
+            _connectionState.value = ConnectionState.CONNECTING
+
+            // 1. Megvárjuk a Wi-Fi hálózati kötést (max 3 mp)
+            withTimeoutOrNull(3000) {
+                networkBoundSignal.await()
+            }
+
+            // 2. Kézfogás küldése retry mechanizmussal (3 próbálkozás, 1.5s timeout)
+            var handshakeOk = false
+            for (attempt in 1..3) {
+                if (!isActive) break
+                val reply = sendAndAwaitReply("command", timeoutMs = 1500)
+                if (reply != null && reply.contains("ok", ignoreCase = true)) {
+                    handshakeOk = true
+                    break
+                }
+                delay(300)
+            }
+
+            if (handshakeOk) {
+                _connectionState.value = ConnectionState.ONLINE
+                _telemetry.value = _telemetry.value.copy(connected = true)
+                startKeepAlive()
+                startTelemetry()
+                startVideoStream()
+            } else {
+                _connectionState.value = ConnectionState.DISCONNECTED
+                _telemetry.value = _telemetry.value.copy(connected = false)
+            }
+        }
     }
 
-    fun startVideoStream() = send("streamon")
+    fun startVideoStream() {
+        if (_connectionState.value == ConnectionState.ONLINE) {
+            send("streamon")
+        }
+    }
+
     fun stopVideoStream() = send("streamoff")
     fun takeOff() = send("takeoff")
     fun land() = send("land")
@@ -84,10 +251,12 @@ class TelloFlightSession(private val context: Context? = null) {
 
     private fun startKeepAlive() {
         keepAliveJob?.cancel()
-        keepAliveJob = scope.launch {
+        keepAliveJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
-                delay(5000)
-                send("command")
+                delay(4000)
+                if (_connectionState.value == ConnectionState.ONLINE) {
+                    send("command")
+                }
             }
         }
     }
@@ -109,6 +278,9 @@ class TelloFlightSession(private val context: Context? = null) {
             tofCm = tof,
             connected = true
         )
+        if (_connectionState.value != ConnectionState.ONLINE) {
+            _connectionState.value = ConnectionState.ONLINE
+        }
 
         dangerousTiltSamples = if (abs(pitch) >= 50 || abs(roll) >= 50) dangerousTiltSamples + 1 else 0
         if (dangerousTiltSamples >= 5) {
@@ -117,8 +289,6 @@ class TelloFlightSession(private val context: Context? = null) {
         }
     }
 
-    private var telemetryJob: Job? = null
-    private var simulationJob: Job? = null
     var simulationMode = false
         set(value) {
             field = value
@@ -128,6 +298,7 @@ class TelloFlightSession(private val context: Context? = null) {
                 simulationJob?.cancel()
                 simulationJob = null
                 startTelemetry()
+                connect()
             }
         }
 
@@ -135,6 +306,7 @@ class TelloFlightSession(private val context: Context? = null) {
         telemetryJob?.cancel()
         telemetrySocket?.close()
         simulationJob?.cancel()
+        _connectionState.value = ConnectionState.ONLINE
         simulationJob = scope.launch {
             var time = 0.0
             while (isActive) {
@@ -163,15 +335,20 @@ class TelloFlightSession(private val context: Context? = null) {
         telemetryJob?.cancel()
         telemetrySocket?.close()
         simulationJob?.cancel()
-        telemetryJob = scope.launch {
+        telemetryJob = scope.launch(Dispatchers.IO) {
+            // Megvárjuk a hálózati kötést a telemetria socket előtt is
+            withTimeoutOrNull(3000) {
+                networkBoundSignal.await()
+            }
+
             runCatching {
                 val currentSocket = DatagramSocket(null).apply {
                     reuseAddress = true
-                    bind(java.net.InetSocketAddress(8890))
-                    soTimeout = 2000
+                    bind(InetSocketAddress(8890))
+                    soTimeout = 2500
                 }
                 telemetrySocket = currentSocket
-                
+
                 val buffer = ByteArray(1024)
                 while (isActive) {
                     try {
@@ -189,6 +366,9 @@ class TelloFlightSession(private val context: Context? = null) {
                         onTelemetry(data)
                     } catch (e: java.net.SocketTimeoutException) {
                         _telemetry.value = _telemetry.value.copy(connected = false)
+                        if (_connectionState.value == ConnectionState.ONLINE) {
+                            _connectionState.value = ConnectionState.DISCONNECTED
+                        }
                     } catch (e: Exception) {
                         break
                     }
@@ -202,41 +382,37 @@ class TelloFlightSession(private val context: Context? = null) {
     }
 
     fun close() {
-        telemetrySocket?.close()
-        telemetrySocket = null
+        connectJob?.cancel()
+        connectJob = null
         keepAliveJob?.cancel()
         keepAliveJob = null
+        telemetryJob?.cancel()
+        telemetryJob = null
         simulationJob?.cancel()
         simulationJob = null
+
+        commandSocket?.close()
+        commandSocket = null
+        telemetrySocket?.close()
+        telemetrySocket = null
+
         val cm = context?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-        networkCallback?.let { cm?.unregisterNetworkCallback(it) }
-        cm?.bindProcessToNetwork(null)
+        networkCallback?.let {
+            runCatching { cm?.unregisterNetworkCallback(it) }
+        }
+        networkCallback = null
+        runCatching { cm?.bindProcessToNetwork(null) }
         scope.cancel()
     }
 
-    private fun send(command: String) = scope.launch {
+    fun send(command: String) = scope.launch(Dispatchers.IO) {
         runCatching {
-            DatagramSocket().use { socket ->
-                val bytes = command.encodeToByteArray()
-                socket.send(DatagramPacket(bytes, bytes.size, host, commandPort))
+            val socket = getOrCreateCommandSocket()
+            val bytes = command.encodeToByteArray()
+            val packet = DatagramPacket(bytes, bytes.size, host, commandPort)
+            sendMutex.withLock {
+                socket.send(packet)
             }
         }
     }
 }
-
-enum class FlipDirection(val sdkValue: String, val label: String) {
-    FORWARD("f", "ELŐRE"),
-    BACK("b", "HÁTRA"),
-    LEFT("l", "BALRA"),
-    RIGHT("r", "JOBBRA")
-}
-
-data class TelloTelemetry(
-    val battery: Int = 0,
-    val temperatureC: Int = 0,
-    val pitch: Int = 0,
-    val roll: Int = 0,
-    val heightCm: Int = 0,
-    val tofCm: Int = 0,
-    val connected: Boolean = false
-)

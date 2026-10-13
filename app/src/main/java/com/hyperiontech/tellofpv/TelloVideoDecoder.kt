@@ -16,14 +16,17 @@ import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.InetSocketAddress
 
 class TelloVideoDecoder(private val scope: CoroutineScope) {
     @Volatile private var codec: MediaCodec? = null
     private var streamJob: Job? = null
     @Volatile private var socket: DatagramSocket? = null
     @Volatile var recorder: TelloStreamRecorder? = null
+    @Volatile var isReady = false
+        private set
 
-    fun start(surface: Surface) {
+    fun start(surface: Surface, onReady: (() -> Unit)? = null) {
         stop()
 
         try {
@@ -48,10 +51,15 @@ class TelloVideoDecoder(private val scope: CoroutineScope) {
             try {
                 currentSocket = DatagramSocket(null).apply {
                     reuseAddress = true
-                    bind(java.net.InetSocketAddress(11111))
+                    receiveBufferSize = 256 * 1024
+                    bind(InetSocketAddress(11111))
                     soTimeout = 3000
                 }
                 socket = currentSocket
+                isReady = true
+
+                // Socket sikeresen megnyitva és kötve a 11111-es portra -> mehet az értesítés
+                onReady?.invoke()
 
                 while (isActive) {
                     try {
@@ -85,6 +93,7 @@ class TelloVideoDecoder(private val scope: CoroutineScope) {
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
+                isReady = false
                 currentSocket?.close()
                 if (socket === currentSocket) {
                     socket = null
@@ -131,6 +140,7 @@ class TelloVideoDecoder(private val scope: CoroutineScope) {
     }
 
     fun stop() {
+        isReady = false
         streamJob?.cancel()
         streamJob = null
         socket?.close()

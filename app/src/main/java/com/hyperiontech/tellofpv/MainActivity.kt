@@ -36,6 +36,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -164,9 +165,8 @@ private fun FpvScreen(onRegisterGamepad: (GamepadHandler) -> Unit) {
     val isTracking by activeTracker.isTracking.collectAsState()
     val trackedTarget by activeTracker.currentTarget.collectAsState()
 
-    val isConnected by remember(session) {
-        session.telemetry.map { it.connected }.distinctUntilChanged()
-    }.collectAsState(initial = false)
+    val connectionState by session.connectionState.collectAsState()
+    val isConnected = connectionState == ConnectionState.ONLINE
 
     var activeSurfaceView by remember { mutableStateOf<SurfaceView?>(null) }
     var trackingJob by remember { mutableStateOf<Job?>(null) }
@@ -184,9 +184,8 @@ private fun FpvScreen(onRegisterGamepad: (GamepadHandler) -> Unit) {
     val currentIsTracking by androidx.compose.runtime.rememberUpdatedState(isTracking)
 
     androidx.compose.runtime.LaunchedEffect(session) {
-            session.connect()
-            session.startTelemetry()
-        }
+        session.connect()
+    }
 
         DisposableEffect(Unit) {
             val handler = GamepadHandler(
@@ -227,8 +226,7 @@ private fun FpvScreen(onRegisterGamepad: (GamepadHandler) -> Unit) {
                     videoDecoder.stop()
                     session.stopVideoStream()
                 } else if (event == Lifecycle.Event.ON_RESUME) {
-                    session.startVideoStream()
-                    // videoDecoder starts in surfaceCreated
+                    session.connect()
                 } else if (event == Lifecycle.Event.ON_DESTROY) {
                     yoloDetector.close()
                     session.close()
@@ -240,9 +238,6 @@ private fun FpvScreen(onRegisterGamepad: (GamepadHandler) -> Unit) {
             }
         }
 
-
-    
-
     Box(Modifier.fillMaxSize().background(Color(0xFF05080C))) {
         // 1. Videostream háttér
         AndroidView(
@@ -251,8 +246,9 @@ private fun FpvScreen(onRegisterGamepad: (GamepadHandler) -> Unit) {
                     activeSurfaceView = this
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
-                            videoDecoder.start(holder.surface)
-                            session.startVideoStream()
+                            videoDecoder.start(holder.surface) {
+                                session.startVideoStream()
+                            }
                         }
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {}
                         override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -271,7 +267,12 @@ private fun FpvScreen(onRegisterGamepad: (GamepadHandler) -> Unit) {
 
         // 3. Felső Taktikai Telemetria Sáv (Bal oldalt)
         Box(modifier = Modifier.align(Alignment.TopStart).padding(start = 24.dp, top = 16.dp)) {
-            TacticalTopHud(session, rssi, flightStartTimeMs)
+            TacticalTopHud(
+                session = session,
+                rssi = rssi,
+                flightStartTimeMs = flightStartTimeMs,
+                onReconnect = { session.connect() }
+            )
         }
 
         // 3/B. Dinamikus Badgek (Középen)
@@ -594,8 +595,15 @@ private fun TacticalFpvOverlay(session: TelloFlightSession, trackedTarget: Track
 }
 
 @Composable
-private fun TacticalTopHud(session: TelloFlightSession, rssi: Int?, flightStartTimeMs: Long?, modifier: Modifier = Modifier) {
+private fun TacticalTopHud(
+    session: TelloFlightSession,
+    rssi: Int?,
+    flightStartTimeMs: Long?,
+    modifier: Modifier = Modifier,
+    onReconnect: () -> Unit = {}
+) {
     val telemetry by session.telemetry.collectAsState()
+    val connectionState by session.connectionState.collectAsState()
     var flightTimeStr by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf("00:00") }
     androidx.compose.runtime.LaunchedEffect(flightStartTimeMs) {
         while (true) {
@@ -613,27 +621,62 @@ private fun TacticalTopHud(session: TelloFlightSession, rssi: Int?, flightStartT
         telemetry.battery > 20 -> Color(0xFFFFB300)
         else -> WarningRed
     }
-    val pulse by rememberInfiniteTransition(label = "wifi").animateFloat(
-        0.4f, 1f,
-        infiniteRepeatable(tween(700), RepeatMode.Reverse),
-        label = "signal"
+    val pulse by rememberInfiniteTransition(label = "pulse").animateFloat(
+        0.3f, 1f,
+        infiniteRepeatable(tween(600), RepeatMode.Reverse),
+        label = "pulse"
     )
+
+    val (statusText, statusColor) = when (connectionState) {
+        ConnectionState.CONNECTING -> "CSATLAKOZÁS..." to Color(0xFFFFD600)
+        ConnectionState.ONLINE -> "ONLINE / READY" to NeonGreen
+        ConnectionState.DISCONNECTED -> "DISCONNECTED" to WarningRed
+    }
 
     Row(
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))
             .background(GlassDark)
             .border(1.dp, GlassBorder, RoundedCornerShape(12.dp))
-            .padding(horizontal = 16.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+            .padding(horizontal = 14.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+        // Csatlakozási állapot badge (DISCONNECTED esetén kattintható az újracsatlakozáshoz)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .background(statusColor.copy(alpha = 0.15f))
+                .border(1.dp, statusColor.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+                .clickable(enabled = connectionState == ConnectionState.DISCONNECTED) { onReconnect() }
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(statusColor)
+                    .alpha(if (connectionState == ConnectionState.CONNECTING) pulse else 1f)
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = statusText,
+                color = statusColor,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.alpha(if (connectionState == ConnectionState.CONNECTING) pulse else 1f)
+            )
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.Timer, "Idő", tint = CyberCyan, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(5.dp))
             Text(flightTimeStr, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
         }
-Row(verticalAlignment = Alignment.CenterVertically) {
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.NetworkWifi, "Wi-Fi", tint = CyberCyan, modifier = Modifier.size(16.dp).alpha(pulse))
             Spacer(Modifier.width(5.dp))
             Text(rssi?.let { "$it dBm" } ?: "-- dBm", color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
@@ -645,7 +688,7 @@ Row(verticalAlignment = Alignment.CenterVertically) {
             Text("${telemetry.battery}%", color = batteryColor, fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
         }
 
-        Text("ALT: ${session.telemetry.value.heightCm} cm", color = NeonGreen, fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold)
+        Text("ALT: ${telemetry.heightCm} cm", color = NeonGreen, fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold)
         Text("TEMP: ${telemetry.temperatureC}°C", color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
     }
 }
@@ -877,10 +920,16 @@ private fun saveSnapshot(context: Context, surfaceView: SurfaceView?) {
                     context.contentResolver.openOutputStream(uri)?.use { out ->
                         bitmap.compress(Bitmap.CompressFormat.JPEG, 100, out)
                     }
-                }.onSuccess { launch(Dispatchers.Main) { Toast.makeText(context, "Pillanatkép mentve a Galériába!", Toast.LENGTH_SHORT).show() } }
-                 .onFailure { launch(Dispatchers.Main) { Toast.makeText(context, "Képmentési hiba történt", Toast.LENGTH_SHORT).show() } }
+                }.onSuccess { 
+                    launch(Dispatchers.Main) { Toast.makeText(context, "Pillanatkép mentve a Galériába!", Toast.LENGTH_SHORT).show() }
+                }.onFailure { 
+                    launch(Dispatchers.Main) { Toast.makeText(context, "Képmentési hiba történt", Toast.LENGTH_SHORT).show() }
+                }.also {
+                    bitmap.recycle()
+                }
             }
         } else {
+            bitmap.recycle()
             Toast.makeText(context, "Nem sikerült a képet rögzíteni", Toast.LENGTH_SHORT).show()
         }
     }, handler)
